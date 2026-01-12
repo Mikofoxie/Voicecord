@@ -1,56 +1,52 @@
+/**
+ * SYSTEM: Voicecord (Optimized for ARM/Low-end)
+ * FEATURES: Static Memory, Ghost Connection Fix, Aggressive Caching
+ */
+
 const fs = require('fs');
 const readline = require('readline');
 const { Client, Options } = require('discord.js-selfbot-v13');
 const { 
-    joinVoiceChannel, 
-    createAudioPlayer, 
-    createAudioResource, 
-    AudioPlayerStatus, 
-    VoiceConnectionStatus, 
-    entersState, 
-    StreamType,
-    NoSubscriberBehavior 
+    joinVoiceChannel, createAudioPlayer, createAudioResource, 
+    AudioPlayerStatus, VoiceConnectionStatus, entersState, 
+    StreamType, NoSubscriberBehavior 
 } = require('@discordjs/voice');
 const { Readable } = require('stream'); 
 
+// === MEMORY OPTIMIZATION ===
+// Pre-allocate buffer to prevent GC spikes (CPU 100% fix)
+const SILENCE_FRAME = Buffer.from([0xF8, 0xFF, 0xFE]);
+
 class Silence extends Readable {
-    _read() {
-        this.push(Buffer.from([0xF8, 0xFF, 0xFE])); 
-    }
+    _read() { this.push(SILENCE_FRAME); } // Zero allocation
 }
 
-const askQuestion = (query) => {
+// === CONFIGURATION ===
+const ask = (q) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    return new Promise((resolve) => rl.question(query, (ans) => { rl.close(); resolve(ans.trim()); }));
+    return new Promise((r) => rl.question(q, (a) => { rl.close(); r(a.trim()); }));
 };
 
-async function setupConfig() {
-    const envPath = './.env';
-    if (fs.existsSync(envPath)) {
-        require('dotenv').config();
-        if (process.env.TOKEN && process.env.GUILD_ID && process.env.CHANNEL_ID) return;
-    }
-    console.log("=== AUTO VOICE SETUP ===");
-    const token = await askQuestion('1. User Token: ');
-    const guildId = await askQuestion('2. Server ID: ');
-    const channelId = await askQuestion('3. Channel ID: ');
-    fs.writeFileSync(envPath, `TOKEN=${token}\nGUILD_ID=${guildId}\nCHANNEL_ID=${channelId}`);
-    console.log("[OK] Config saved. Starting bot...\n");
+async function setup() {
+    if (fs.existsSync('./.env')) { require('dotenv').config(); return; }
+    const t = await ask('Token: ');
+    const g = await ask('Guild ID: ');
+    const c = await ask('Channel ID: ');
+    fs.writeFileSync('./.env', `TOKEN=${t}\nGUILD_ID=${g}\nCHANNEL_ID=${c}`);
     require('dotenv').config();
 }
 
-async function runBot() {
-    await setupConfig();
+// === BOT LOGIC ===
+async function run() {
+    await setup();
 
+    // Disable caching to save RAM
     const client = new Client({ 
-        checkUpdate: false,
+        checkUpdate: false, patchVoice: true,
         makeCache: Options.cacheWithLimits({
-            MessageManager: 0,
-            PresenceManager: 0,
-            UserManager: 0,
-            GuildMemberManager: 0,
-            ThreadManager: 0,
-            ApplicationCommandManager: 0,
+            MessageManager: 0, PresenceManager: 0, UserManager: 0,
+            GuildMemberManager: 0, ThreadManager: 0, ReactionManager: 0,
+            VoiceStateManager: 10 // Minimal cache for voice tracking
         }),
     });
 
@@ -59,117 +55,91 @@ async function runBot() {
     let isReconnecting = false;
 
     function playSilence() {
-        if (!player) return;
-        const resource = createAudioResource(new Silence(), { 
-            inputType: StreamType.Opus,
-            inlineVolume: false 
-        });
-        player.play(resource);
+        if (!player || player.state.status === AudioPlayerStatus.Playing) return;
+        const r = createAudioResource(new Silence(), { inputType: StreamType.Opus });
+        player.play(r);
     }
 
-    async function connectToVoice() {
+    async function connect() {
         if (isReconnecting) return;
         isReconnecting = true;
 
         const guild = client.guilds.cache.get(process.env.GUILD_ID);
-        const channel = guild?.channels.cache.get(process.env.CHANNEL_ID);
-
-        if (!guild || !channel) {
-            console.log(`[RETRY] Server/Channel not ready. Retrying in 10s...`);
-            isReconnecting = false;
-            return setTimeout(connectToVoice, 10000);
+        // Fetch to ensure channel exists (Fix TempVoice deletion issue)
+        let channel = guild?.channels.cache.get(process.env.CHANNEL_ID);
+        if (!channel) {
+            try { channel = await client.channels.fetch(process.env.CHANNEL_ID); } 
+            catch { console.log("[ERR] Channel not found/deleted."); isReconnecting = false; return; }
         }
 
-        try {
-            if (connection) {
-                connection.removeAllListeners(); 
-                connection.destroy();
-            }
-            if (player) {
-                player.stop();
-            }
-            
-            if (guild.me?.voice?.channelId) {
-                await guild.me.voice.disconnect().catch(() => {});
-                await new Promise(r => setTimeout(r, 1000));
-            }
-        } catch (e) {}
-        
-        connection = null;
-        player = null;
+        // === GHOST BUSTER PROTOCOL ===
+        // Force Gateway disconnect to kill zombie sessions
+        try { if (guild.me?.voice?.channelId) await guild.me.voice.disconnect(); } catch {}
+        try { if (connection) connection.destroy(); } catch {}
 
-        console.log(`[CONNECT] Joining channel: ${channel.name}...`);
+        console.log(`[NET] Connecting to ${channel.name}...`);
 
         try {
             connection = joinVoiceChannel({
-                channelId: channel.id,
-                guildId: guild.id,
+                channelId: channel.id, guildId: guild.id,
                 adapterCreator: guild.voiceAdapterCreator,
-                selfDeaf: false,
-                selfMute: true
+                selfDeaf: false, selfMute: true
             });
 
-            player = createAudioPlayer({
-                behaviors: { noSubscriber: NoSubscriberBehavior.Play },
+            player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+            
+            player.on(AudioPlayerStatus.Idle, () => {
+                if (connection?.state.status !== VoiceConnectionStatus.Destroyed) playSilence();
             });
-
-            player.on(AudioPlayerStatus.Idle, () => playSilence());
-            player.on('error', () => playSilence());
+            player.on('error', () => setTimeout(playSilence, 1000));
 
             playSilence();
             connection.subscribe(player);
-
-            console.log("[OK] Voice connected & Streaming silence!");
+            console.log("[OK] Connected.");
             isReconnecting = false;
 
+            // === NETWORK RESILIENCE ===
             connection.on(VoiceConnectionStatus.Disconnected, async () => {
-                console.warn("[WARN] Connection lost! Waiting for recovery...");
+                console.warn("[WARN] Disconnected. Checking network...");
                 try {
+                    // Phase 1: Wait 5s for auto-recovery
                     await Promise.race([
-                        entersState(connection, VoiceConnectionStatus.Signalling, 20_000),
-                        entersState(connection, VoiceConnectionStatus.Connecting, 20_000),
+                        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+                        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
                     ]);
-                    console.log("[INFO] Connection recovered.");
-                } catch (error) {
-                    console.error("[ERROR] Network fatal. Re-joining in 30s...");
+                    console.log("[INFO] Auto-recovered.");
+                } catch {
+                    // Phase 2: Force Reconnect
+                    console.warn("[WARN] Hard disconnect. Re-initializing...");
                     if (connection) connection.destroy();
                     isReconnecting = false;
-                    setTimeout(connectToVoice, 30000); 
+                    setTimeout(connect, Math.random() * 2000 + 1000); // Jitter delay
                 }
             });
 
-        } catch (error) {
-            console.error("[ERR] Join failed:", error.message);
+        } catch (e) {
+            console.error(`[ERR] Join failed: ${e.message}`);
             isReconnecting = false;
-            setTimeout(connectToVoice, 30000);
+            setTimeout(connect, 5000);
         }
     }
 
     client.on('ready', () => {
-        console.log(`[BOT] Logged in as: ${client.user.tag}`);
-        connectToVoice();
-
+        console.log(`[SYS] Logged as ${client.user.tag}`);
+        connect();
+        
+        // Watchdog: Check every 60s
         setInterval(() => {
-            if (isReconnecting) return;
-            const guild = client.guilds.cache.get(process.env.GUILD_ID);
-            const me = guild?.members?.me; 
-            
-            if (!me?.voice?.channelId || me.voice.channelId !== process.env.CHANNEL_ID) {
-                console.log("[WATCHDOG] Bot disconnected. Re-connecting...");
-                connectToVoice();
-            } else if (player && player.state.status === AudioPlayerStatus.Idle) {
-                 playSilence();
-            }
-        }, 120000);
+            const me = client.guilds.cache.get(process.env.GUILD_ID)?.members?.me;
+            if (!me?.voice?.channelId || me.voice.channelId !== process.env.CHANNEL_ID) connect();
+        }, 60000);
     });
 
-    client.login(process.env.TOKEN).catch(e => {
-        console.log("[FATAL] Invalid Token.");
-        process.exit(1);
-    });
+    client.login(process.env.TOKEN).catch(() => process.exit(1));
 }
 
-process.on('unhandledRejection', (err) => {});
-process.on('uncaughtException', (err) => {});
+// Anti-Crash
+process.on('unhandledRejection', (e) => console.log(`[LOG] ${e.message}`));
+process.on('uncaughtException', (e) => console.log(`[LOG] ${e.message}`));
 
-runBot();
+run();
