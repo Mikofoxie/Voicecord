@@ -1,7 +1,6 @@
 /**
- * PROJECT: Voicecord (Node.js Edition) - FINAL FIX
- * TARGET: Termux / Low-end Device / Unstable WiFi
- * SPECIALTY: TempVoice Persistence (Zombie Mode)
+ * PROJECT: Voicecord (Node.js Edition) - SMART RAM CLEANER
+ * TARGET: High Population Servers (1000+ users in voice)
  */
 
 const fs = require("fs");
@@ -58,6 +57,7 @@ async function run() {
   const client = new Client({
     checkUpdate: false,
     patchVoice: true,
+
     makeCache: Options.cacheWithLimits({
       MessageManager: 0,
       PresenceManager: 0,
@@ -65,8 +65,20 @@ async function run() {
       GuildMemberManager: 0,
       ThreadManager: 0,
       ReactionManager: 0,
-      VoiceStateManager: 10,
+
+      VoiceStateManager: Infinity,
     }),
+
+    sweepers: {
+      voiceStates: {
+        interval: 60,
+        filter: () => (voiceState, id) => {
+          if (client.user && id === client.user.id) return false;
+
+          return true;
+        },
+      },
+    },
   });
 
   let connection = null;
@@ -92,9 +104,7 @@ async function run() {
       try {
         channel = await client.channels.fetch(process.env.CHANNEL_ID);
       } catch {
-        console.error(
-          "[ERR] Kênh không tồn tại (TempVoice deleted?). Thử lại sau 10s..."
-        );
+        console.error("[ERR] Kênh không tìm thấy. Thử lại sau 10s...");
         isReconnecting = false;
         return setTimeout(connect, 10000);
       }
@@ -107,7 +117,7 @@ async function run() {
       }
     } catch {}
 
-    console.log(`[NET] Đang kết nối lại vào: ${channel.name}...`);
+    console.log(`[NET] Đang kết nối vào: ${channel.name}...`);
 
     try {
       connection = joinVoiceChannel({
@@ -122,25 +132,28 @@ async function run() {
         behaviors: { noSubscriber: NoSubscriberBehavior.Play },
       });
 
-      player.on(AudioPlayerStatus.Idle, () => playSilence());
+      player.on(AudioPlayerStatus.Idle, () => {
+        if (connection?.state.status !== VoiceConnectionStatus.Destroyed)
+          playSilence();
+      });
       player.on("error", () => setTimeout(playSilence, 1000));
 
       playSilence();
       connection.subscribe(player);
 
-      console.log("[OK] Đã vào kênh (Zombie Mode Active).");
+      console.log("[OK] Đã vào kênh (Smart Cache Mode).");
       isReconnecting = false;
 
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        console.warn("[WARN] Mất kết nối! Đang gồng mình chờ mạng...");
+        console.warn("[WARN] Rớt mạng. Đang chờ...");
         try {
           await Promise.race([
             entersState(connection, VoiceConnectionStatus.Signalling, 120_000),
             entersState(connection, VoiceConnectionStatus.Connecting, 120_000),
           ]);
-          console.log("[INFO] Mạng đã có lại. Tiếp tục phát.");
+          console.log("[INFO] Mạng đã có lại.");
         } catch {
-          console.warn("[WARN] Hết 2 phút. Bắt buộc tạo kết nối mới...");
+          console.warn("[WARN] Timeout 2 phút. Re-connecting...");
           if (connection) connection.destroy();
           isReconnecting = false;
           setTimeout(connect, 2000);
@@ -166,14 +179,16 @@ async function run() {
         !me?.voice?.channelId ||
         me.voice.channelId !== process.env.CHANNEL_ID
       ) {
-        console.log("[WATCHDOG] Bot bị kick/văng. Re-connecting...");
+        console.log(
+          "[WATCHDOG] Phát hiện bot không trong kênh. Re-connecting..."
+        );
         connect();
       }
     }, 60000);
   });
 
   client.login(process.env.TOKEN).catch(() => {
-    console.error("[FATAL] Token sai hoặc bị chặn.");
+    console.error("[FATAL] Token lỗi.");
     process.exit(1);
   });
 }
