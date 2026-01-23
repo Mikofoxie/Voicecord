@@ -75,8 +75,8 @@ const connect = async () => {
       } catch { try { conn.destroy(); } catch {} retry('Link lost'); }
     });
 
-    // Timeout 60s for slow networks
-    await entersState(conn, VoiceConnectionStatus.Ready, 60000);
+    // Timeout 1m30s for slow networks
+    await entersState(conn, VoiceConnectionStatus.Ready, 90000);
     log(`CONNECTED: ${CHANNEL_ID}`);
     backoff = 1000;
 
