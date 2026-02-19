@@ -1,0 +1,21 @@
+{
+  "name": "voicecord",
+  "version": "1.0.0",
+  "description": "Self-bot voicecord 24/7",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "latest",
+    "@snazzah/davey": "latest",
+    "debug": "^4.4.3",
+    "discord.js-selfbot-v13": "latest",
+    "dotenv": "^16.4.5",
+    "libsodium-wrappers": "^0.7.13",
+    "opusscript": "^0.0.8"
+  },
+  "engines": {
+    "node": ">=16.9.0"
+  }
+}
