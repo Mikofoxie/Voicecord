@@ -26,11 +26,17 @@ const setup = async () => {
   }
 };
 
-// --- 2. UTILS ---
+// --- 2. UTILS & OPTIMIZATION ---
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
-const silence = () => createAudioResource(new Readable({ read() { this.push(Buffer.from([0xf8, 0xff, 0xfe])); } }), { inputType: StreamType.Opus });
 
-// --- 3. STATE & CONFIG ---
+const silence = () => createAudioResource(new Readable({
+    read() {
+        this.push(Buffer.from([0xf8, 0xff, 0xfe]));
+        this.push(null);
+    }
+}), { inputType: StreamType.Opus });
+
+// --- 3. STATE & CACHE KILLER ---
 const client = new Client({
   checkUpdate: false,
   patchVoice: true,
@@ -41,67 +47,104 @@ const client = new Client({
     GuildMemberManager: 0,
     ThreadManager: 0,
     ReactionManager: 0,
-    VoiceStateManager: Infinity,
+    GuildMessageManager: 0,
+    GuildBanManager: 0,
+    GuildInviteManager: 0,
+    StageInstanceManager: 0,
+    VoiceStateManager: 0,
   }),
 });
 
 let backoff = 1000;
+let isConnecting = false;
 
 // --- 4. CORE LOGIC ---
 const connect = async () => {
+  if (isConnecting) return;
+  isConnecting = true;
+  
   const { GUILD_ID, CHANNEL_ID } = process.env;
-  const guild = client.guilds.cache.get(GUILD_ID);
-  if (!guild) return retry('Guild miss');
-
+  
   try {
+    log(`[VOICE] Connecting to channel ${CHANNEL_ID}...`);
+    
     const conn = joinVoiceChannel({
-      channelId: CHANNEL_ID, guildId: GUILD_ID, adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false, selfMute: true, group: client.user.id
+      channelId: CHANNEL_ID, 
+      guildId: GUILD_ID, 
+      adapterCreator: client.guilds.cache.get(GUILD_ID)?.voiceAdapterCreator || client.guilds.forge(GUILD_ID).voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: true,
+      group: client.user.id
     });
 
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
     conn.subscribe(player);
     player.play(silence());
 
-    player.on('idle', () => player.play(silence()));
+    player.on('idle', () => setTimeout(() => player.play(silence()), 1000));
     player.on('error', () => {}); 
     
     conn.on(VoiceConnectionStatus.Disconnected, async () => {
+      isConnecting = false;
+      log('[VOICE] Disconnected! Waiting 10s for auto-recovery...');
       try {
         await Promise.race([
-          entersState(conn, VoiceConnectionStatus.Signalling, 5000),
-          entersState(conn, VoiceConnectionStatus.Connecting, 5000),
+          entersState(conn, VoiceConnectionStatus.Signalling, 10000),
+          entersState(conn, VoiceConnectionStatus.Connecting, 10000),
         ]);
-      } catch { try { conn.destroy(); } catch {} retry('Link lost'); }
+        log('[VOICE] Connection recovered!');
+      } catch (e) {
+        log('[VOICE] Recovery failed, forcing reconnect...');
+        try { conn.destroy(); } catch {} 
+        retry('Link lost permanently'); 
+      }
     });
 
-    // Timeout 1m30s for slow networks
-    await entersState(conn, VoiceConnectionStatus.Ready, 90000);
-    log(`CONNECTED: ${CHANNEL_ID}`);
+    await entersState(conn, VoiceConnectionStatus.Ready, 30000);
+    log(`[VOICE] SUCCESS: Connected to ${CHANNEL_ID}`);
     backoff = 1000;
+    isConnecting = false;
 
-  } catch (e) { retry(e.message); }
+  } catch (e) { 
+      isConnecting = false;
+      retry(e.message); 
+  }
 };
 
 const retry = (msg) => {
-  log(`WARN: ${msg}. Retry ${backoff/1000}s`);
+  log(`[WARN] ${msg}. Retrying in ${backoff/1000}s`);
   setTimeout(connect, backoff);
   backoff = Math.min(backoff * 2, 60000);
 };
 
-// --- 5. BOOTSTRAP ---
+// --- 5. BOOTSTRAP & WATCHDOG ---
 client.on('ready', () => {
-  log(`USER: ${client.user.tag}`);
+  log(`[SYSTEM] Login successful: ${client.user.tag}`);
   connect();
-  setInterval(() => {
-    if (client.guilds.cache.get(process.env.GUILD_ID)?.members?.me?.voice?.channelId !== process.env.CHANNEL_ID) retry('Watchdog');
-  }, 60000);
 });
 
+client.on('voiceStateUpdate', (oldState, newState) => {
+    if (newState.id === client.user.id && newState.channelId !== process.env.CHANNEL_ID) {
+        log('[WATCHDOG] Disconnected from channel! Reconnecting...');
+        isConnecting = false;
+        connect();
+    }
+});
+
+setInterval(() => {
+    if (global.gc) {
+        global.gc();
+        log('[MEMORY] Garbage collection triggered');
+    }
+}, 600000);
+
 process.on('SIGINT', () => process.exit(0));
-process.on('unhandledRejection', () => {});
+process.on('unhandledRejection', (e) => log(`[FATAL] Unhandled rejection: ${e.message}`));
 
 (async () => {
   await setup();
-  client.login(process.env.TOKEN).catch(() => { console.error('Auth failed'); process.exit(1); });
+  client.login(process.env.TOKEN).catch((e) => { 
+      console.error(`[AUTH] Login failed: ${e.message}`); 
+      process.exit(1); 
+  });
 })();
